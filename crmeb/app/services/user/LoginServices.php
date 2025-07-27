@@ -221,25 +221,35 @@ class LoginServices extends BaseServices
      * @throws \think\db\exception\DbException
      * @throws \think\db\exception\ModelNotFoundException
      */
-    public function register($account, $password, $spread, $user_type = 'h5')
+    public function register($account, $password, $spread, $user_type = 'h5', $invite_code = '')
     {
-        if ($this->dao->getOne(['account|phone' => $account, 'is_del' => 0])) {
+        if ($this->dao->getOne(['account|email' => $account, 'is_del' => 0])) {
+            throw new ApiException(410028);
+        }
+        if ($this->dao->getOne(['invite_code' => $invite_code, 'is_del' => 0])) {
             throw new ApiException(410028);
         }
         /** @var UserServices $userServices */
         $userServices = app()->make(UserServices::class);
-        $phone = $account;
+        $email = $account;
         $data['account'] = $account;
         $data['pwd'] = md5((string)$password);
-        $data['phone'] = $phone;
-        if ($spread) {
-            $data['spread_uid'] = $spread;
-            $data['spread_time'] = time();
-            $spreadInfo = $userServices->get($spread);
-            $data['division_id'] = $spreadInfo['division_id'];
-            $data['agent_id'] = $spreadInfo['agent_id'];
-            $data['staff_id'] = $spreadInfo['staff_id'];
+        $data['email'] = $email;
+
+        //生成随机邀请码
+        $invite_code = rand(100000, 999999);
+        while (!$this->dao->getOne(['invite_code' => $invite_code])) {
+            $invite_code = rand(100000, 999999);
         }
+
+        $inviteInfo = $userServices->get(['invite_code' => $invite_code]);
+        $data['invite_id'] = $inviteInfo['id'];
+        $data['invite_code'] = $invite_code;
+        $data['spread_time'] = time();
+        $data['division_id'] = $inviteInfo['division_id'];
+        $data['agent_id'] = $inviteInfo['agent_id'];
+        $data['staff_id'] = $inviteInfo['staff_id'];
+        
         $data['real_name'] = '';
         $data['birthday'] = 0;
         $data['card_id'] = '';

@@ -20,29 +20,31 @@ use think\Validate;
  */
 class RegisterValidates extends Validate
 {
-    protected $regex = ['phone' => '/^1[3456789]\d{9}$/'];
+    protected $regex = ['email' => '/^[_a-z0-9-]+(\.[_a-z0-9-]+)*@[a-z0-9-]+(\.[a-z0-9-]+)*(\.[a-z]{2,})$/'];
+    // protected $regex = ['phone' => '/^1[3456789]\d{9}$/'];
 
     protected $rule = [
-        'phone' => 'require|regex:phone',
-        'account' => 'require|regex:phone',
-        'captcha' => 'require|length:6',
+        // 'phone' => 'require|regex:phone',
+        'email' => 'require|regex:email',
+        'account' => 'require|regex:email',
+        // 'captcha' => 'require|length:6',
         'password' => 'require',
     ];
 
     protected $message = [
-        'phone.require' => '410015',
-        'phone.regex' => '410018',
+        'email.require' => '410015',
+        'email.regex' => '410018',
         'account.require' => '410015',
         'account.regex' => '410018',
-        'captcha.require' => '410004',
-        'captcha.length' => '410010',
+        // 'captcha.require' => '410004',
+        // 'captcha.length' => '410010',
         'password.require' => '410011',
     ];
 
 
     public function sceneCode()
     {
-        return $this->only(['phone']);
+        return $this->only(['email']);
     }
 
 

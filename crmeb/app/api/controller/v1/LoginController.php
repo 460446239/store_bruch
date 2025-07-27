@@ -209,24 +209,24 @@ class LoginController
      */
     public function register(Request $request)
     {
-        [$account, $captcha, $password, $spread] = $request->postMore([['account', ''], ['captcha', ''], ['password', ''], ['spread', 0]], true);
+        [$account, $invite_code, $password, $spread] = $request->postMore([['account', ''], ['invite_code', ''], ['password', ''], ['spread', 0]], true);
         try {
-            validate(RegisterValidates::class)->scene('register')->check(['account' => $account, 'captcha' => $captcha, 'password' => $password]);
+            validate(RegisterValidates::class)->scene('register')->check(['account' => $account, 'password' => $password]);
         } catch (ValidateException $e) {
             return app('json')->fail($e->getError());
         }
         if (strlen(trim($password)) < 6 || strlen(trim($password)) > 32) {
             return app('json')->fail(400762);
         }
-        $verifyCode = CacheService::get('code_' . $account);
-        if (!$verifyCode)
-            return app('json')->fail(410009);
-        $verifyCode = substr($verifyCode, 0, 6);
-        if ($verifyCode != $captcha)
-            return app('json')->fail(410010);
-        if (md5($password) == md5('123456')) return app('json')->fail(410012);
+        // $verifyCode = CacheService::get('code_' . $account);
+        // if (!$verifyCode)
+        //     return app('json')->fail(410009);
+        // $verifyCode = substr($verifyCode, 0, 6);
+        // if ($verifyCode != $captcha)
+        //     return app('json')->fail(410010);
+        // if (md5($password) == md5('123456')) return app('json')->fail(410012);
 
-        $registerStatus = $this->services->register($account, $password, $spread, 'h5');
+        $registerStatus = $this->services->register($account, $password, $spread, 'h5', $invite_code);
         if ($registerStatus) {
             return app('json')->success(410013);
         }
