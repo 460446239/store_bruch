@@ -43,7 +43,7 @@ class UserController
     public function userInfo(Request $request)
     {
         $info = $request->user()->toArray();
-        return app('json')->success($this->services->userInfo($info));
+        return app('json')->success($info['uid']);
     }
 
     /**

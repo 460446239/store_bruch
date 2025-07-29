@@ -23,4 +23,5 @@ return [
     \app\http\middleware\BaseMiddleware::class,
     // 多语言支持
     \think\middleware\LoadLangPack::class,
+    \think\middleware\AllowCrossDomain::class,
 ];

@@ -8,499 +8,533 @@
 // +----------------------------------------------------------------------
 // | Author: CRMEB Team <admin@crmeb.com>
 // +----------------------------------------------------------------------
-declare (strict_types=1);
 
-namespace app\services\user;
+namespace app\api\controller\v1;
 
-use app\dao\user\UserDao;
-use app\services\BaseServices;
-use app\services\yihaotong\SmsRecordServices;
+use app\Request;
 use app\services\message\notice\SmsService;
-use app\services\wechat\WechatUserServices;
-use crmeb\exceptions\ApiException;
-use crmeb\services\CacheService;
-use crmeb\services\HttpService;
-use Firebase\JWT\JWT;
+use app\services\wechat\WechatServices;
 use think\facade\Config;
+use crmeb\services\CacheService;
+use app\services\user\LoginServices;
+use think\exception\ValidateException;
+use app\api\validate\user\RegisterValidates;
 
 /**
- *
- * Class LoginServices
- * @package app\services\user
+ * 微信小程序授权类
+ * Class AuthController
+ * @package app\api\controller
  */
-class LoginServices extends BaseServices
+class LoginController
 {
+    protected $services;
 
     /**
-     * LoginServices constructor.
-     * @param UserDao $dao
+     * LoginController constructor.
+     * @param LoginServices $services
      */
-    public function __construct(UserDao $dao)
+    public function __construct(LoginServices $services)
     {
-        $this->dao = $dao;
+        $this->services = $services;
     }
 
     /**
      * H5账号登陆
-     * @param $account
-     * @param $password
-     * @param $spread
-     * @return array
+     * @param Request $request
+     * @return mixed
      * @throws \think\db\exception\DataNotFoundException
-     * @throws \think\db\exception\DbException
      * @throws \think\db\exception\ModelNotFoundException
+     * @throws \think\exception\DbException
      */
-    public function login($account, $password, $spread, $agent_id)
+    public function login(Request $request)
     {
-        $user = $this->dao->getOne(['account|phone' => $account, 'is_del' => 0]);
-        if ($user) {
-            if ($user->pwd !== md5((string)$password))
-                throw new ApiException(410025);
-            if ($user->pwd === md5('123456'))
-                throw new ApiException(410026);
-        } else {
-            throw new ApiException(410025);
+        [$account, $password, $spread, $agent_id] = $request->postMore([
+            'account', 'password', ['spread', 'h5'], ['agent_id', 0]
+        ], true);
+        if (!$account || !$password) {
+            return app('json')->fail(410000);
         }
-        if (!$user['status'])
-            throw new ApiException(410027);
-
-        //更新用户信息
-        if ($agent_id) {
-            $this->updateUserInfo(['code' => $agent_id, 'is_staff' => 1], $user);
-        } else {
-            $this->updateUserInfo(['code' => $spread], $user);
+        if (strlen(trim($password)) < 6 || strlen(trim($password)) > 32) {
+            return app('json')->fail(400762);
         }
-        $token = $this->createToken((int)$user['uid'], 'api');
-        if ($token) {
-            return ['token' => $token['token'], 'expires_time' => $token['params']['exp']];
-        } else
-            throw new ApiException(410019);
+        return app('json')->success(410001, $this->services->login($account, $password, $spread, $agent_id));
     }
 
     /**
-     * 更新用户信息
-     * @param $user
-     * @param $userInfo
-     * @param false $is_new
+     * 退出登录
+     * @param Request $request
+     * @return mixed
+     */
+    public function logout(Request $request)
+    {
+        $key = trim(ltrim($request->header(Config::get('cookie.token_name')), 'Bearer'));
+        CacheService::delete(md5($key));
+        return app('json')->success(410002);
+    }
+
+    /**
+     * 获取发送验证码key
+     * @return mixed
+     */
+    public function verifyCode()
+    {
+        $unique = password_hash(uniqid(true), PASSWORD_BCRYPT);
+        CacheService::set('sms.key.' . $unique, 0, 300);
+        $time = sys_config('verify_expire_time', 1);
+        return app('json')->success(['key' => $unique, 'expire_time' => $time]);
+    }
+
+    /**
+     * 获取图片验证码
+     * @param Request $request
+     * @return \think\Response
+     */
+    public function captcha(Request $request)
+    {
+        ob_clean();
+        $rep = captcha();
+        $key = app('session')->get('captcha.key');
+        $uni = $request->get('key');
+        if ($uni) {
+            CacheService::set('sms.key.cap.' . $uni, $key, 300);
+        }
+        return $rep;
+    }
+
+    /**
+     * 验证验证码是否正确
+     * @param $uni
+     * @param string $code
      * @return bool
-     * @throws \think\db\exception\DataNotFoundException
-     * @throws \think\db\exception\DbException
-     * @throws \think\db\exception\ModelNotFoundException
+     * @throws \Psr\SimpleCache\InvalidArgumentException
      */
-    public function updateUserInfo($user, $userInfo, $is_new = false)
+    protected function checkCaptcha($uni, string $code): bool
     {
-        $data = [];
-        $data['phone'] = !isset($user['phone']) || !$user['phone'] ? $userInfo->phone : $user['phone'];
-        $data['last_time'] = time();
-        $data['last_ip'] = app()->request->ip();
-        $spreadUid = $user['code'] ?? 0;
-        //如果扫了员工邀请码，上级，代理商，区域代理都会改动。
-        if (isset($user['is_staff']) && !$userInfo['is_agent'] && !$userInfo['is_division']) {
-            $spreadInfo = $this->dao->get($spreadUid);
-            if ($userInfo['uid'] != $spreadUid) {
-                $data['spread_uid'] = $spreadUid;
-                $data['spread_time'] = $userInfo->last_time;
-            }
-            $data['agent_id'] = $spreadInfo->agent_id;
-            $data['division_id'] = $spreadInfo->division_id;
-            $data['staff_id'] = $userInfo['uid'];
-            $data['is_staff'] = $user['is_staff'] ?? 0;
-            $data['division_type'] = 3;
-            $data['division_status'] = 1;
-            $data['division_change_time'] = time();
-            $data['division_end_time'] = $spreadInfo->division_end_time;
-            //如果店员切换代理商，则店员在之前代理商下推广的用户，他们的直接上级从当前店员变为之前代理商
-            if ($userInfo->agent_id != 0 && $userInfo->agent_id != $spreadInfo->agent_id) {
-                $this->dao->update(['staff_id' => $userInfo['uid'], 'spread_uid' => $userInfo['uid']], ['spread_uid' => $spreadInfo['agent_id'], 'staff_id' => 0]);
-                $this->dao->update(['staff_id' => $userInfo['uid'], 'not_spread_uid' => $userInfo['uid']], ['staff_id' => 0]);
-            }
-            //绑定用户后置事件
-            event('UserRegisterListener', [$spreadUid, $userInfo['user_type'], $userInfo['nickname'], $userInfo['uid'], $is_new]);
-            //推送消息
-            event('NoticeListener', [['spreadUid' => $spreadUid, 'user_type' => $userInfo['user_type'], 'nickname' => $userInfo['nickname']], 'bind_spread_uid']);
-
-            //自定义事件-绑定关系
-            event('CustomEventListener', ['user_spread', [
-                'uid' => $userInfo['uid'],
-                'nickname' => $userInfo['nickname'],
-                'spread_uid' => $spreadUid,
-                'spread_time' => date('Y-m-d H:i:s'),
-                'user_type' => $userInfo['user_type'],
-            ]]);
-
-        } else {
-            if ($is_new) {
-                if ($spreadUid) {
-                    $spreadInfo = $this->dao->get($spreadUid);
-                    $spreadUid = (int)$spreadUid;
-                    $data['spread_uid'] = $spreadUid;
-                    $data['spread_time'] = time();
-                    $data['agent_id'] = $spreadInfo->agent_id;
-                    $data['division_id'] = $spreadInfo->division_id;
-                    $data['staff_id'] = $spreadInfo->staff_id;
-                    //绑定用户后置事件
-                    event('UserRegisterListener', [$spreadUid, $userInfo['user_type'], $userInfo['nickname'], $userInfo['uid'], 1]);
-                    //推送消息
-                    event('NoticeListener', [['spreadUid' => $spreadUid, 'user_type' => $userInfo['user_type'], 'nickname' => $userInfo['nickname']], 'bind_spread_uid']);
-
-                    //自定义事件-绑定关系
-                    event('CustomEventListener', ['user_spread', [
-                        'uid' => $userInfo['uid'],
-                        'nickname' => $userInfo['nickname'],
-                        'spread_uid' => $spreadUid,
-                        'spread_time' => date('Y-m-d H:i:s'),
-                        'user_type' => $userInfo['user_type'],
-                    ]]);
-                }
-            } else {
-                //永久绑定
-                $store_brokerage_binding_status = sys_config('store_brokerage_binding_status', 1);
-                if ($userInfo->spread_uid && $store_brokerage_binding_status == 1 && !isset($user['is_staff'])) {
-                    $data['login_type'] = $user['login_type'] ?? $userInfo->login_type;
-                } else {
-                    //绑定分销关系 = 所有用户
-                    if (sys_config('brokerage_bindind', 1) == 1) {
-                        //分销绑定类型为时间段且过期 ｜｜临时
-                        $store_brokerage_binding_time = sys_config('store_brokerage_binding_time', 30);
-                        if (!$userInfo['spread_uid'] || $store_brokerage_binding_status == 3 || ($store_brokerage_binding_status == 2 && ($userInfo['spread_time'] + $store_brokerage_binding_time * 24 * 3600) < time())) {
-                            if ($spreadUid && $user['code'] != $userInfo->uid && $userInfo->uid != $this->dao->value(['uid' => $spreadUid], 'spread_uid')) {
-                                $spreadInfo = $this->dao->get($spreadUid);
-                                $spreadUid = (int)$spreadUid;
-                                $data['spread_uid'] = $spreadUid;
-                                $data['spread_time'] = time();
-                                $data['agent_id'] = $spreadInfo->agent_id;
-                                $data['division_id'] = $spreadInfo->division_id;
-                                $data['staff_id'] = $spreadInfo->staff_id;
-                                //绑定用户后置事件
-                                event('UserRegisterListener', [$spreadUid, $userInfo['user_type'], $userInfo['nickname'], $userInfo['uid'], 0]);
-                                //推送消息
-                                event('NoticeListener', [['spreadUid' => $spreadUid, 'user_type' => $userInfo['user_type'], 'nickname' => $userInfo['nickname']], 'bind_spread_uid']);
-
-                                //自定义事件-绑定关系
-                                event('CustomEventListener', ['user_spread', [
-                                    'uid' => $userInfo['uid'],
-                                    'nickname' => $userInfo['nickname'],
-                                    'spread_uid' => $spreadUid,
-                                    'spread_time' => date('Y-m-d H:i:s'),
-                                    'user_type' => $userInfo['user_type'],
-                                ]]);
-                            }
-                        }
-                    }
-                }
-            }
+        $cacheName = 'sms.key.cap.' . $uni;
+        if (!CacheService::has($cacheName)) {
+            return false;
         }
-        if (!$this->dao->update($userInfo['uid'], $data, 'uid')) {
-            throw new ApiException(100007);
+        $key = CacheService::get($cacheName);
+        $code = mb_strtolower($code, 'UTF-8');
+        $res = password_verify($code, $key);
+        if ($res) {
+            CacheService::delete($cacheName);
         }
-        return true;
-    }
-
-    public function verify(SmsService $services, $phone, $type, $time)
-    {
-        if ($this->dao->getOne(['account' => $phone, 'is_del' => 0]) && $type == 'register') {
-            throw new ApiException(410028);
-        }
-        $code = rand(100000, 999999);
-        $data['code'] = $code;
-        $data['time'] = $time;
-        $res = $services->send(true, $phone, $data, 'verify_code');
-        if ($res !== true)
-            throw new ApiException(410031);
-        return $code;
+        return $res;
     }
 
     /**
-     * H5用户注册
-     * @param $account
-     * @param $password
-     * @param $spread
-     * @param string $user_type
+     * 验证码发送
+     * @param Request $request
+     * @param SmsService $services
+     * @return mixed
+     */
+    public function verify(Request $request, SmsService $services)
+    {
+        [$phone, $type, $key, $captchaType, $captchaVerification] = $request->postMore([
+            ['phone', 0],
+            ['type', ''],
+            ['key', ''],
+            ['captchaType', ''],
+            ['captchaVerification', ''],
+        ], true);
+
+        $keyName = 'sms.key.' . $key;
+        if (!CacheService::has($keyName)) return app('json')->fail(410003);
+
+        // 验证限制
+        // 验证码每分钟发送上限
+        $maxMinuteCountKey = 'sms.minute.' . $phone . date('YmdHi');
+        $minuteCount = 0;
+        if (CacheService::has($maxMinuteCountKey)) {
+            $minuteCount = CacheService::get($maxMinuteCountKey) ?? 0;
+            $maxMinuteCount = Config::get('sms.maxMinuteCount', 5);
+            if ($minuteCount > $maxMinuteCount) return app('json')->fail('同一手机号每分钟最多发送' . $maxMinuteCount . '条');
+
+        }
+
+        // 验证码单个手机每日发送上限
+        $maxPhoneCountKey = 'sms.phone.' . $phone . '.' . date('Ymd');
+        $phoneCount = 0;
+        if (CacheService::has($maxPhoneCountKey)) {
+            $phoneCount = CacheService::get($maxPhoneCountKey) ?? 0;
+            $maxPhoneCount = Config::get('sms.maxPhoneCount', 20);
+            if ($phoneCount > $maxPhoneCount) return app('json')->fail('同一手机号每天最多发送' . $maxPhoneCount . '条');
+
+        }
+
+        // 验证码单个手机每日发送上限
+        $maxIpCountKey = 'sms.ip.' . app()->request->ip() . '.' . date('Ymd');
+        $ipCount = 0;
+        if (CacheService::has($maxIpCountKey)) {
+            $ipCount = CacheService::get($maxPhoneCountKey) ?? 0;
+            $maxIpCount = Config::get('sms.maxIpCount', 50);
+            if ($ipCount > $maxIpCount) return app('json')->fail('同一IP每天最多发送' . $maxIpCount . '条');
+
+        }
+
+        //二次验证
+        try {
+            aj_captcha_check_two($captchaType, $captchaVerification);
+        } catch (\Throwable $e) {
+            return app('json')->fail($e->getError());
+        }
+
+        try {
+            validate(RegisterValidates::class)->scene('code')->check(['phone' => $phone]);
+        } catch (ValidateException $e) {
+            return app('json')->fail($e->getError());
+        }
+        $time = sys_config('verify_expire_time', 1);
+        $smsCode = $this->services->verify($services, $phone, $type, $time);
+        if ($smsCode) {
+            CacheService::set('code_' . $phone, $smsCode, $time * 60);
+            CacheService::set($maxMinuteCountKey, (int)$minuteCount + 1, 61);
+            CacheService::set($maxPhoneCountKey, (int)$phoneCount + 1, 86401);
+            CacheService::set($maxIpCountKey, (int)$ipCount + 1, 86401);
+            return app('json')->success(410007);
+        } else {
+            return app('json')->fail(410008);
+        }
+
+    }
+
+    /**
+     * H5注册新用户
+     * @param Request $request
      * @return mixed
      * @throws \think\db\exception\DataNotFoundException
      * @throws \think\db\exception\DbException
      * @throws \think\db\exception\ModelNotFoundException
      */
-    public function register($account, $password, $spread, $user_type = 'h5', $invite_code = '')
+    public function register(Request $request)
     {
-        if ($this->dao->getOne(['account|email' => $account, 'is_del' => 0])) {
-            throw new ApiException(410028);
+        [$account, $invite_code, $password, $spread] = $request->postMore([['account', ''], ['invite_code', ''], ['password', ''], ['spread', 0]], true);
+        try {
+            validate(RegisterValidates::class)->scene('register')->check(['account' => $account, 'password' => $password]);
+        } catch (ValidateException $e) {
+            return app('json')->fail($e->getError());
         }
-        if ($this->dao->getOne(['invite_code' => $invite_code, 'is_del' => 0])) {
-            throw new ApiException(410028);
+        if (strlen(trim($password)) < 6 || strlen(trim($password)) > 32) {
+            return app('json')->fail(400762);
         }
-        /** @var UserServices $userServices */
-        $userServices = app()->make(UserServices::class);
-        $email = $account;
-        $data['account'] = $account;
-        $data['pwd'] = md5((string)$password);
-        $data['email'] = $email;
+        // $verifyCode = CacheService::get('code_' . $account);
+        // if (!$verifyCode)
+        //     return app('json')->fail(410009);
+        // $verifyCode = substr($verifyCode, 0, 6);
+        // if ($verifyCode != $captcha)
+        //     return app('json')->fail(410010);
+        // if (md5($password) == md5('123456')) return app('json')->fail(410012);
 
-        //生成随机邀请码
-        $invite_code = rand(100000, 999999);
-        while (!$this->dao->getOne(['invite_code' => $invite_code])) {
-            $invite_code = rand(100000, 999999);
+        $registerStatus = $this->services->register($account, $password, $spread, 'h5', $invite_code);
+        if ($registerStatus['status']) {
+            return app('json')->success(100);
         }
-
-        $inviteInfo = $userServices->get(['invite_code' => $invite_code]);
-        $data['invite_id'] = $inviteInfo['id'];
-        $data['invite_code'] = $invite_code;
-        $data['spread_time'] = time();
-        $data['division_id'] = $inviteInfo['division_id'];
-        $data['agent_id'] = $inviteInfo['agent_id'];
-        $data['staff_id'] = $inviteInfo['staff_id'];
         
-        $data['real_name'] = '';
-        $data['birthday'] = 0;
-        $data['card_id'] = '';
-        $data['mark'] = '';
-        $data['addres'] = '';
-        $data['user_type'] = $user_type;
-        $data['add_time'] = time();
-        $data['add_ip'] = app('request')->ip();
-        $data['last_time'] = time();
-        $data['last_ip'] = app('request')->ip();
-        $data['nickname'] = substr_replace($account, '****', 3, 4);
-        $data['avatar'] = sys_config('h5_avatar');
-        $data['city'] = '';
-        $data['language'] = '';
-        $data['province'] = '';
-        $data['country'] = '';
-        $data['status'] = 1;
-        if (!$re = $this->dao->save($data)) {
-            throw new ApiException(410014);
-        } else {
-            $userServices->rewardNewUser((int)$re->uid);
-            //用户生成后置事件
-            event('UserRegisterListener', [$spread, $user_type, $data['nickname'], $re->uid, 1]);
-
-            //自定义事件-用户注册
-            event('CustomEventListener', ['user_register', [
-                'uid' => $re->uid,
-                'nickname' => $data['nickname'],
-                'phone' => $data['phone'],
-                'add_time' => date('Y-m-d H:i:s'),
-                'user_type' => $user_type,
-            ]]);
-
-            if ($spread) {
-                //推送消息
-                event('NoticeListener', [['spreadUid' => $spread, 'user_type' => $user_type, 'nickname' => $data['nickname']], 'bind_spread_uid']);
-
-                //自定义事件-绑定关系
-                event('CustomEventListener', ['user_spread', [
-                    'uid' => $re->uid,
-                    'nickname' => $data['nickname'],
-                    'spread_uid' => $spread,
-                    'spread_time' => date('Y-m-d H:i:s'),
-                    'user_type' => $user_type,
-                ]]);
-            }
-            return $re;
-        }
+        return app('json')->fail($registerStatus['code']);
     }
 
     /**
-     * 重置密码
-     * @param $account
-     * @param $password
-     * @return bool
+     * 密码修改
+     * @param Request $request
+     * @return mixed
      * @throws \think\db\exception\DataNotFoundException
      * @throws \think\db\exception\DbException
      * @throws \think\db\exception\ModelNotFoundException
      */
-    public function reset($account, $password)
+    public function reset(Request $request)
     {
-        $user = $this->dao->getOne(['account|phone' => $account, 'is_del' => 0], 'uid');
-        if (!$user) {
-            throw new ApiException(410032);
+        [$account, $captcha, $password] = $request->postMore([['account', ''], ['captcha', ''], ['password', '']], true);
+        try {
+            validate(RegisterValidates::class)->scene('register')->check(['account' => $account, 'captcha' => $captcha, 'password' => $password]);
+        } catch (ValidateException $e) {
+            return app('json')->fail($e->getError());
         }
-        if (!$this->dao->update($user['uid'], ['pwd' => md5((string)$password)], 'uid')) {
-            throw new ApiException(410033);
+        if (strlen(trim($password)) < 6 || strlen(trim($password)) > 32) {
+            return app('json')->fail(400762);
         }
-        return true;
+        $verifyCode = CacheService::get('code_' . $account);
+        if (!$verifyCode)
+            return app('json')->fail(410009);
+        $verifyCode = substr($verifyCode, 0, 6);
+        if ($verifyCode != $captcha) {
+            return app('json')->fail(410010);
+        }
+        if ($password == '123456') return app('json')->fail(410012);
+        $resetStatus = $this->services->reset($account, $password);
+        if ($resetStatus) return app('json')->success(100001);
+        return app('json')->fail(100007);
     }
 
     /**
      * 手机号登录
-     * @param $phone
-     * @param $spread
-     * @param string $user_type
-     * @return array
+     * @param Request $request
+     * @return mixed
      * @throws \think\db\exception\DataNotFoundException
-     * @throws \think\db\exception\DbException
      * @throws \think\db\exception\ModelNotFoundException
+     * @throws \think\exception\DbException
      */
-    public function mobile($phone, $spread, string $user_type = 'h5', $agent_id = 0)
+    public function mobile(Request $request)
     {
-        //数据库查询
-        $user = $this->dao->getOne(['account|phone' => $phone, 'is_del' => 0]);
-        if (!$user) {
-            $user = $this->register($phone, '123456', $spread, $user_type);
-            if (!$user) {
-                throw new ApiException(410034);
-            }
+        [$phone, $captcha, $spread, $agent_id] = $request->postMore([['phone', ''], ['captcha', ''], ['spread', 0], ['agent_id', 0]], true);
+
+        //验证手机号
+        try {
+            validate(RegisterValidates::class)->scene('code')->check(['phone' => $phone]);
+        } catch (ValidateException $e) {
+            return app('json')->fail($e->getError());
         }
 
-        if (!$user->status)
-            throw new ApiException(410027);
-
-        // 设置推广关系
-        if ($agent_id) {
-            $this->updateUserInfo(['code' => $agent_id, 'is_staff' => 1], $user);
-        } else {
-            $this->updateUserInfo(['code' => $spread], $user);
+        //验证验证码
+        $verifyCode = CacheService::get('code_' . $phone);
+        if (!$verifyCode)
+            return app('json')->fail(410009);
+        $verifyCode = substr($verifyCode, 0, 6);
+        if ($verifyCode != $captcha) {
+            return app('json')->fail(410010);
         }
-
-        $token = $this->createToken((int)$user['uid'], 'api');
+        $user_type = $request->getFromType() ? $request->getFromType() : 'h5';
+        $token = $this->services->mobile($phone, $spread, $user_type, $agent_id);
         if ($token) {
-            return ['token' => $token['token'], 'expires_time' => $token['params']['exp']];
+            CacheService::delete('code_' . $phone);
+            return app('json')->success(410001, $token);
         } else {
-            throw new ApiException(410019);
+            return app('json')->fail(410002);
         }
     }
 
     /**
-     * 切换登录
-     * @param $user
-     * @param $from
-     * @return array
+     * H5切换登陆
+     * @param Request $request
+     * @return mixed
      * @throws \think\db\exception\DataNotFoundException
-     * @throws \think\db\exception\DbException
      * @throws \think\db\exception\ModelNotFoundException
+     * @throws \think\exception\DbException
      */
-    public function switchAccount($user, $from)
+    public function switch_h5(Request $request)
     {
-        if ($from === 'h5') {
-            $where = [['phone', '=', $user['phone']], ['user_type', '<>', 'h5'], ['is_del', '=', 0]];
-            $login_type = 'wechat';
-        } else {
-            //数据库查询
-            $where = [['account|phone', '=', $user['phone']], ['user_type', '=', 'h5'], ['is_del', '=', 0]];
-            $login_type = 'h5';
-        }
-        $switch_user = $this->dao->getOne($where);
-        if (!$switch_user) {
-            return app('json')->fail(410035);
-        }
-        if (!$switch_user->status) {
-            return app('json')->fail(410027);
-        }
-        $edit_data = ['login_type' => $login_type];
-        if (!$this->dao->update($switch_user['uid'], $edit_data, 'uid')) {
-            throw new ApiException(410036);
-        }
-        $token = $this->createToken((int)$switch_user['uid'], 'api');
+        $from = $request->post('from', 'wechat');
+        $user = $request->user();
+        $token = $this->services->switchAccount($user, $from);
         if ($token) {
-            return ['token' => $token['token'], 'expires_time' => $token['params']['exp']];
-        } else {
-            throw new ApiException(410019);
-        }
+            $token['userInfo'] = $user;
+            return app('json')->success(410001, $token);
+        } else
+            return app('json')->fail(410002);
     }
 
     /**
-     * 绑定手机号(静默还没写入用户信息)
-     * @param $phone
-     * @param string $key
-     * @return array
+     * 绑定手机号
+     * @param Request $request
+     * @return mixed
+     * @throws \think\db\exception\DataNotFoundException
+     * @throws \think\db\exception\ModelNotFoundException
+     * @throws \think\exception\DbException
+     */
+    public function binding_phone(Request $request)
+    {
+        list($phone, $captcha, $key) = $request->postMore([
+            ['phone', ''],
+            ['captcha', ''],
+            ['key', '']
+        ], true);
+        //验证手机号
+        try {
+            validate(RegisterValidates::class)->scene('code')->check(['phone' => $phone]);
+        } catch (ValidateException $e) {
+            return app('json')->fail($e->getError());
+        }
+        if (!$key) {
+            return app('json')->fail(100100);
+        }
+        if (!$phone) {
+            return app('json')->fail(410015);
+        }
+        //验证验证码
+        $verifyCode = CacheService::get('code_' . $phone);
+        if (!$verifyCode)
+            return app('json')->fail(410009);
+        $verifyCode = substr($verifyCode, 0, 6);
+        if ($verifyCode != $captcha) {
+            return app('json')->fail(410010);
+        }
+        $re = $this->services->bindind_phone($phone, $key);
+        if ($re) {
+            CacheService::delete('code_' . $phone);
+            return app('json')->success(410016, $re);
+        } else
+            return app('json')->fail(410017);
+    }
+
+    /**
+     * 绑定手机号
+     * @param Request $request
+     * @return mixed
+     * @throws \think\db\exception\DataNotFoundException
+     * @throws \think\db\exception\ModelNotFoundException
+     * @throws \think\exception\DbException
+     */
+    public function user_binding_phone(Request $request)
+    {
+        list($phone, $captcha, $step) = $request->postMore([
+            ['phone', ''],
+            ['captcha', ''],
+            ['step', 0]
+        ], true);
+
+        //验证手机号
+        try {
+            validate(RegisterValidates::class)->scene('code')->check(['phone' => $phone]);
+        } catch (ValidateException $e) {
+            return app('json')->fail($e->getError());
+        }
+        if (!$step) {
+            //验证验证码
+            $verifyCode = CacheService::get('code_' . $phone);
+            if (!$verifyCode)
+                return app('json')->fail(410009);
+            $verifyCode = substr($verifyCode, 0, 6);
+            if ($verifyCode != $captcha)
+                return app('json')->fail(410010);
+        }
+        $uid = (int)$request->uid();
+        $re = $this->services->userBindindPhone($uid, $phone, $step);
+        if ($re) {
+            CacheService::delete('code_' . $phone);
+            return app('json')->success($re['msg'] ?? 410016, $re['data'] ?? []);
+        } else
+            return app('json')->fail(410017);
+    }
+
+    public function update_binding_phone(Request $request)
+    {
+        [$phone, $captcha] = $request->postMore([
+            ['phone', ''],
+            ['captcha', ''],
+        ], true);
+
+        //验证手机号
+        try {
+            validate(RegisterValidates::class)->scene('code')->check(['phone' => $phone]);
+        } catch (ValidateException $e) {
+            return app('json')->fail($e->getError());
+        }
+        //验证验证码
+        $verifyCode = CacheService::get('code_' . $phone);
+        if (!$verifyCode)
+            return app('json')->fail(410009);
+        $verifyCode = substr($verifyCode, 0, 6);
+        if ($verifyCode != $captcha)
+            return app('json')->fail(410010);
+        $uid = (int)$request->uid();
+        $re = $this->services->updateBindindPhone($uid, $phone);
+        if ($re) {
+            CacheService::delete('code_' . $phone);
+            return app('json')->success($re['msg'] ?? 100001, $re['data'] ?? []);
+        } else
+            return app('json')->fail(100007);
+    }
+
+    /**
+     * 设置扫描二维码状态
+     * @param string $code
+     * @return mixed
+     */
+    public function setLoginKey(string $code)
+    {
+        if (!$code) {
+            return app('json')->fail(410020);
+        }
+        $cacheCode = CacheService::get($code);
+        if ($cacheCode === false || $cacheCode === null) {
+            return app('json')->fail(410021);
+        }
+        CacheService::set($code, '0', 600);
+        return app('json')->success();
+    }
+
+    /**
+     * apple快捷登陆
+     * @param Request $request
+     * @param WechatServices $services
+     * @return mixed
      * @throws \Psr\SimpleCache\InvalidArgumentException
      * @throws \think\db\exception\DataNotFoundException
      * @throws \think\db\exception\ModelNotFoundException
      */
-    public function bindind_phone($phone, string $key = '')
+    public function appleLogin(Request $request, WechatServices $services)
     {
-        if (!$key) {
-            throw new ApiException(410037);
+        [$openId, $phone, $email, $captcha] = $request->postMore([
+            ['openId', ''],
+            ['phone', ''],
+            ['email', ''],
+            ['captcha', '']
+        ], true);
+        if ($phone) {
+            if (!$captcha) {
+                return app('json')->fail(410004);
+            }
+            //验证验证码
+            $verifyCode = CacheService::get('code_' . $phone);
+            if (!$verifyCode)
+                return app('json')->fail(410009);
+            $verifyCode = substr($verifyCode, 0, 6);
+            if ($verifyCode != $captcha) {
+                CacheService::delete('code_' . $phone);
+                return app('json')->fail(410010);
+            }
         }
-        [$openid, $wechatInfo, $spreadId, $agent_id, $login_type, $userType] = $createData = CacheService::get($key);
-        if (!$createData) {
-            throw new ApiException(410037);
-        }
-        $wechatInfo['phone'] = $phone;
-        /** @var WechatUserServices $wechatUser */
-        $wechatUser = app()->make(WechatUserServices::class);
-        //更新用户信息
-        $user = $wechatUser->wechatOauthAfter([$openid, $wechatInfo, $spreadId, $agent_id, $login_type, $userType]);
-        $token = $this->createToken((int)$user['uid'], 'api');
+        if ($email == '') $email = substr(md5($openId), 0, 12);
+        $userInfo = [
+            'openId' => $openId,
+            'unionid' => '',
+            'avatarUrl' => sys_config('h5_avatar'),
+            'nickName' => $email,
+        ];
+        $token = $services->appAuth($userInfo, $phone, 'apple');
         if ($token) {
-            return [
-                'token' => $token['token'],
-                'userInfo' => $user,
-                'expires_time' => $token['params']['exp'],
-            ];
-        } else
-            return app('json')->fail(410019);
-    }
-
-    /**
-     * 用户绑定手机号
-     * @param int $uid
-     * @param $phone
-     * @param $step
-     * @return array
-     * @throws \think\db\exception\DataNotFoundException
-     * @throws \think\db\exception\DbException
-     * @throws \think\db\exception\ModelNotFoundException
-     */
-    public function userBindindPhone(int $uid, $phone, $step)
-    {
-        $userInfo = $this->dao->get($uid);
-        if (!$userInfo) {
-            throw new ApiException(410113);
-        }
-        if ($this->dao->getOne([['phone', '=', $phone], ['user_type', '<>', 'h5'], ['is_del', '=', 0]])) {
-            throw new ApiException(410039);
-        }
-        if ($userInfo->phone) {
-            throw new ApiException(410040);
-        }
-        $data = [];
-        if ($this->dao->getOne(['account' => $phone, 'phone' => $phone, 'user_type' => 'h5', 'is_del' => 0])) {
-            if (!$step) return ['msg' => 410041, 'data' => ['is_bind' => 1]];
+            return app('json')->success(410001, $token);
+        } else if ($token === false) {
+            return app('json')->success(410001, ['isbind' => true]);
         } else {
-            $data['account'] = $phone;
+            return app('json')->fail(410019);
         }
-        $data['phone'] = $phone;
-        if ($this->dao->update($userInfo['uid'], $data, 'uid') || $userInfo->phone == $phone)
-            return ['msg' => 410016, 'data' => []];
-        else
-            throw new ApiException(410017);
+
     }
 
     /**
-     * 用户绑定手机号
-     * @param int $uid
-     * @param $phone
-     * @return array
-     * @throws \think\db\exception\DataNotFoundException
-     * @throws \think\db\exception\DbException
-     * @throws \think\db\exception\ModelNotFoundException
+     * 滑块验证
+     * @return mixed
      */
-    public function updateBindindPhone(int $uid, $phone)
+    public function ajcaptcha(Request $request)
     {
-        $userInfo = $this->dao->get(['uid' => $uid, 'is_del' => 0]);
-        if (!$userInfo) {
-            throw new ApiException(410113);
-        }
-        if ($userInfo->phone == $phone) {
-            throw new ApiException(410042);
-        }
-        if ($this->dao->getOne([['phone', '=', $phone], ['is_del', '=', 0]])) {
-            throw new ApiException(410043);
-        }
-        $data = [];
-        $data['phone'] = $phone;
-        $data['account'] = $phone;
-        if ($this->dao->update($userInfo['uid'], $data, 'uid'))
-            return ['msg' => 100001, 'data' => []];
-        else
-            throw new ApiException(100007);
+        $captchaType = $request->get('captchaType');
+        return app('json')->success(aj_captcha_create($captchaType));
     }
 
     /**
-     * 远程注册登录
-     * @param string $out_token
-     * @return array
+     * 一次验证
+     * @return mixed
+     */
+    public function ajcheck(Request $request)
+    {
+        [$token, $pointJson, $captchaType] = $request->postMore([
+            ['token', ''],
+            ['pointJson', ''],
+            ['captchaType', ''],
+        ], true);
+        try {
+            aj_captcha_check_one($captchaType, $token, $pointJson);
+            return app('json')->success();
+        } catch (\Throwable $e) {
+            return app('json')->fail(400336);
+        }
+    }
+
+    /**
+     * 远程登录接口
+     * @param Request $request
+     * @return \think\Response
      * @throws \Psr\SimpleCache\InvalidArgumentException
      * @throws \think\db\exception\DataNotFoundException
      * @throws \think\db\exception\DbException
@@ -509,50 +543,12 @@ class LoginServices extends BaseServices
      * @email 442384644@qq.com
      * @date 2024/5/21
      */
-    public function remoteRegister(string $out_token = '')
+    public function remoteRegister(Request $request)
     {
-        $info = JWT::jsonDecode(JWT::urlsafeB64Decode($out_token));
-        $userInfo = $this->dao->get(['uid' => $info->uid]);
-        $data = [];
-        if (!$userInfo) {
-            $data['uid'] = $info->uid;
-            $data['account'] = $info->phone != '' ? $info->phone : 'out_' . $info->uid;
-            $data['phone'] = $info->phone;
-            $data['pwd'] = md5('123456');
-            $data['real_name'] = $info->nickname;
-            $data['birthday'] = 0;
-            $data['card_id'] = '';
-            $data['mark'] = '';
-            $data['addres'] = '';
-            $data['user_type'] = 'h5';
-            $data['add_time'] = time();
-            $data['add_ip'] = app('request')->ip();
-            $data['last_time'] = time();
-            $data['last_ip'] = app('request')->ip();
-            $data['nickname'] = $info->nickname;
-            $data['avatar'] = $info->avatar;
-            $data['city'] = '';
-            $data['language'] = '';
-            $data['province'] = '';
-            $data['country'] = '';
-            $data['status'] = 1;
-            $data['now_money'] = $info->now_money;
-            $data['integral'] = $info->integral;
-            $data['exp'] = $info->exp;
-            $this->dao->save($data);
-        } else {
-            $data['nickname'] = $info->nickname;
-            $data['avatar'] = $info->avatar;
-            $data['now_money'] = $info->now_money;
-            $data['integral'] = $info->integral;
-            $data['exp'] = $info->exp;
-            $this->dao->update($info->uid, $data);
-        }
-        $token = $this->createToken((int)$info->uid, 'api');
-        if ($token) {
-            return ['token' => $token['token'], 'expires_time' => $token['params']['exp']];
-        } else {
-            throw new ApiException('登录失败');
-        }
+        [$remote_token] = $request->getMore([
+            ['remote_token', ''],
+        ], true);
+        if ($remote_token == '') return app('json')->success('登录失败', ['get_remote_login_url' => sys_config('get_remote_login_url')]);
+        return app('json')->success('登录成功', $this->services->remoteRegister($remote_token));
     }
 }
